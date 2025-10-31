@@ -1,0 +1,123 @@
+---
+title: "R Notebook - Doublet Detection with scDblFinder"
+author: Srivalli Kolla
+output: html_notebook
+---
+
+# SETUP AND LOAD LIBRARIES
+
+```{r}
+library(Seurat)
+library(SingleCellExperiment)
+library(scDblFinder)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+# LOAD FILTERED AND NORMALIZED DATA
+
+```{r}
+INPUT_OBJECT_PATH <- "data/processed/combined_filtered_normalized.rds"
+SAVE_OBJECT_PATH <- "data/processed/combined_singlets_filtered.rds"
+
+if (!file.exists(INPUT_OBJECT_PATH)) {
+    stop("ERROR: Filtered and normalized object not found. Run 02_filtering_normalization.Rmd first!")
+}
+combined_filtered <- readRDS(INPUT_OBJECT_PATH)
+
+print(paste("Loaded filtered object with", ncol(combined_filtered), "nuclei."))
+```
+
+# PREPARE DATA FOR DOUBLET FINDING
+
+Run initial dimensionality reduction and clustering on the filtered data. This is necessary because scDblFinder uses the proximity of cells in reduced space to model doublets.
+
+```{r}
+# Use the SCT assay
+DefaultAssay(combined_filtered) <- "SCT"
+
+# Set PCs based on typical expectations for scRNA-seq
+PC_TO_USE <- 30 
+
+# Run PCA, Neighbors, and initial Clustering (for context and plotting)
+combined_filtered <- RunPCA(combined_filtered, verbose = FALSE, npcs = 50)
+combined_filtered <- FindNeighbors(combined_filtered, dims = 1:PC_TO_USE)
+combined_filtered <- FindClusters(combined_filtered, resolution = 0.5) 
+combined_filtered <- RunUMAP(combined_filtered, dims = 1:PC_TO_USE, verbose = FALSE)
+
+# Convert Seurat to SingleCellExperiment (required by scDblFinder)
+sce <- as.SingleCellExperiment(combined_filtered, assay = 'SCT')
+```
+
+# RUN scDblFinder
+
+```{r}
+# Run scDblFinder (batch-aware using Sample_ID)
+sce <- scDblFinder(sce, samples = 'Sample_ID', verbose = FALSE)
+
+# Add doublet results back to the Seurat object metadata
+combined_filtered$scDblFinder_class <- colData(sce)$scDblFinder.class
+combined_filtered$scDblFinder_score <- colData(sce)$scDblFinder.score
+
+print("Doublet marking complete. Annotations added to metadata.")
+```
+
+# FILTER OUT DOUBLETS
+
+```{r}
+n_cells_pre_doublet_filter <- ncol(combined_filtered)
+
+# Subset to keep only cells where scDblFinder_class is "singlet"
+combined_singlets <- subset(combined_filtered, subset = scDblFinder_class == "singlet")
+
+n_doublets_removed <- n_cells_pre_doublet_filter - ncol(combined_singlets)
+pct_doublets_removed <- round(n_doublets_removed / n_cells_pre_doublet_filter * 100, 2)
+
+print(paste("Cells before doublet filtering:", n_cells_pre_doublet_filter))
+print(paste("Doublets removed:", n_doublets_removed, paste0("(", pct_doublets_removed, "%)")))
+print(paste("Cells remaining (Singlets):", ncol(combined_singlets)))
+```
+
+# VISUALIZATION AND SUMMARY
+Plots are generated using the pre-filtered object (combined_filtered) to show where the doublets were located before removal.
+
+```{r}
+# Summarize doublets per sample (using the pre-filtered object for reporting)
+doublet_summary <- combined_filtered@meta.data %>%
+ group_by(Sample_ID) %>%
+ summarise(
+  total_cells_pre_filter = n(),
+  n_doublets = sum(scDblFinder_class == "doublet"),
+  pct_doublets = round(100 * n_doublets / total_cells_pre_filter, 2)
+ ) %>%
+ arrange(Sample_ID)
+
+doublet_summary
+```
+
+```{r}
+# UMAP plot highlighting doublets (using the pre-filtered object for plotting)
+p_umap_doublet <- DimPlot(
+ combined_filtered,
+ group.by = "scDblFinder_class",
+ reduction = "umap",
+ pt.size = 0.5,
+ raster = FALSE,
+ cols = c("singlet" = "grey70", "doublet" = "red") 
+) +
+ labs(title = "UMAP Highlighting scDblFinder Doublets (Pre-Filter)") +
+ theme_minimal(base_size = 12) +
+  guides(color = guide_legend(override.aes = list(size = 3))) 
+
+print(p_umap_doublet)
+ggsave("plots/03_UMAP_doublets_scDblFinder.png", plot = p_umap_doublet, width = 7, height = 6, dpi = 300)
+```
+
+# SAVE THE FILTERED SINGLETS OBJECT
+
+```{r}
+# Save the new object containing ONLY singlets
+saveRDS(combined_singlets, file = SAVE_OBJECT_PATH)
+print("Step 3 (Doublet Filtering) Complete. Object saved containing only singlets.")
+```
