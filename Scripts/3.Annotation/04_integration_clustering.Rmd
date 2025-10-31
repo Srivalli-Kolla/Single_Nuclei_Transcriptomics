@@ -1,0 +1,129 @@
+---
+title: "R Notebook - Batch Correction (SCT Integration) and Final Clustering"
+author: Srivalli Kolla
+output: html_notebook
+---
+
+# SETUP AND LOAD LIBRARIES
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(future)
+```
+
+# LOAD SINGLETS DATA
+
+```{r}
+INPUT_OBJECT_PATH <- "data/processed/combined_singlets_filtered.rds"
+SAVE_OBJECT_PATH <- "data/processed/combined_integrated_clustered.rds"
+
+if (!file.exists(INPUT_OBJECT_PATH)) {
+    stop("ERROR: Singlet-filtered object not found. Run 03_doublet_detection.Rmd first!")
+}
+combined_integrated <- readRDS(INPUT_OBJECT_PATH)
+
+print(paste("Loaded singlet object with", ncol(combined_integrated), "nuclei and", nrow(combined_integrated), "features."))
+```
+
+# BATCH CORRECTION VIA SCT INTEGRATION
+Integrate data from different samples (Sample_ID) to mitigate batch effects.
+
+```{r}
+PC_TO_USE <- 30 
+
+# Split the object by the batch variable
+seurat_list <- SplitObject(combined_integrated, split.by = "Sample_ID")
+
+# Select features for integration (using features from the 'SCT' assay)
+features <- SelectIntegrationFeatures(object.list = seurat_list, 
+                                      nfeatures = 3000)
+
+# Prepare for integration
+seurat_list <- PrepSCTIntegration(object.list = seurat_list, 
+                                  anchor.features = features)
+
+# Find integration anchors
+anchors <- FindIntegrationAnchors(object.list = seurat_list, 
+                                  normalization.method = "SCT", 
+                                  anchor.features = features, 
+                                  dims = 1:PC_TO_USE,
+                                  verbose = FALSE)
+
+# Integrate the data (stored in the new 'integrated' assay)
+combined_integrated <- IntegrateData(anchorset = anchors, 
+                                     normalization.method = "SCT", 
+                                     dims = 1:PC_TO_USE,
+                                     verbose = FALSE)
+
+# Set the default assay to the batch-corrected 'integrated' data
+DefaultAssay(combined_integrated) <- "integrated"
+print("SCT Integration complete. Default assay set to 'integrated'.")
+```
+
+# DIMENSIONALITY REDUCTION AND CLUSTERING
+
+## PCA and UMAP
+
+```{r}
+# Run PCA on the integrated assay
+combined_integrated <- RunPCA(combined_integrated, npcs = 50, verbose = FALSE)
+
+# Run UMAP on the integrated PCs
+combined_integrated <- RunUMAP(combined_integrated, 
+                               reduction = "pca", 
+                               dims = 1:PC_TO_USE, 
+                               verbose = FALSE)
+```
+
+## Clustering
+
+```{r}
+# Construct the Shared Nearest Neighbor (SNN) graph
+combined_integrated <- FindNeighbors(combined_integrated, 
+                                     reduction = "pca", 
+                                     dims = 1:PC_TO_USE, 
+                                     verbose = FALSE)
+
+#  Apply the Louvain algorithm to cluster the cells
+combined_integrated <- FindClusters(combined_integrated, 
+                                     resolution = 0.8,  # Adjust resolution as needed
+                                     verbose = FALSE)
+
+# Check the number of clusters found
+table(combined_integrated@active.ident)
+```
+
+## Visualization of Integrated Results
+
+```{r}
+# Plot UMAP colored by Cluster ID
+p_umap_clusters <- DimPlot(combined_integrated, 
+                           reduction = "umap", 
+                           label = TRUE, 
+                           repel = TRUE,
+                           group.by = "seurat_clusters") + 
+                           labs(title = paste0("UMAP: ", table(combined_integrated@active.ident) %>% length(), " Clusters Found"))
+
+# Plot UMAP colored by Sample ID (Verify batch effect removal)
+p_umap_sample <- DimPlot(combined_integrated, 
+                         reduction = "umap", 
+                         group.by = "Sample_ID") + 
+                         labs(title = "UMAP Colored by Sample (Post-Integration)")
+
+# Combine plots
+p_combined_integration <- p_umap_clusters | p_umap_sample
+print(p_combined_integration)
+ggsave("plots/04_UMAP_Integrated_Clustering.png", p_combined_integration, width = 14, height = 6)
+```
+
+# SAVE THE INTEGRATED OBJECT
+
+```{r}
+# Save the final integrated and clustered object for marker finding (Step 5)
+saveRDS(combined_integrated, file = SAVE_OBJECT_PATH)
+print(paste("Step 4 Complete: Integrated and clustered Seurat object saved to:", SAVE_OBJECT_PATH))
+```
+

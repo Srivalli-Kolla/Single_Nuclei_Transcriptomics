@@ -1,0 +1,194 @@
+---
+title: "R Notebook - Marker Gene Annotation"
+author: Srivalli Kolla
+output: html_notebook
+---
+
+# SETUP AND LOAD LIBRARIES
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(scales)
+library(AUCell)
+library(pheatmap)
+```
+
+# LOAD INTEGRATED AND CLUSTERED DATA
+
+```{r}
+INPUT_OBJECT_PATH <- "data/processed/combined_integrated_clustered.rds"
+SAVE_OBJECT_PATH <- "data/processed/combined_marker_genes_annotated.rds"
+
+if (!file.exists(INPUT_OBJECT_PATH)) {
+  stop("ERROR: Integrated and clustered object not found. Run 04_integration_clustering.Rmd first!")
+}
+singlets <- readRDS(INPUT_OBJECT_PATH)
+DefaultAssay(singlets) <- "SCT"
+print(paste("Loaded clustered object with", ncol(singlets), "nuclei."))
+```
+
+# LOAD AND PREPARE MARKER GENES
+
+```{r}
+# Load the semi-colon delimited marker gene file
+marker_df <- read.csv(MARKER_FILE_PATH, stringsAsFactors = FALSE, sep = ";")
+
+# Convert the dataframe into a named list of gene sets
+# 1. Select the required columns.
+# 2. Split the comma-separated genes.
+# 3. Group by cell type name.
+# 4. Create the final named list.
+
+marker_list <- marker_df %>%
+select(`major.cell.type.names`, `defining.marker.genes`) %>%
+distinct() %>%
+group_by(`major.cell.type.names`) %>%
+summarize(genes = list(unique(unlist(str_split(`defining.marker.genes`, ","))))) %>%
+{ setNames(.$genes, .$`major.cell.type.names`) }
+
+print(paste("Loaded", length(marker_list), "marker gene sets."))
+```
+
+# METHOD 1: Seurat Module Scoring for Annotation
+
+```{r}
+# Calculate Module Scores
+for (cell_type in names(marker_list)) {
+genes <- intersect(marker_list[[cell_type]], rownames(singlets))
+# Note: AddModuleScore automatically appends '1' to the column name
+singlets <- AddModuleScore(
+ singlets,
+ features = list(genes),
+ name = paste0("score_", gsub(" ", "_", cell_type))
+)
+}
+
+# Determine the top two cell types based on module score per cluster
+clusters <- singlets$seurat_clusters
+cluster_scores <- data.frame()
+
+for (cell_type in names(marker_list)) {
+score_col <- paste0("score_", gsub(" ", "_", cell_type), "1")
+mean_scores <- tapply(singlets@meta.data[[score_col]], clusters, mean)
+cluster_scores <- rbind(cluster_scores, data.frame(cluster = names(mean_scores), cell_type = cell_type, avg_score = as.numeric(mean_scores)))
+}
+
+# Assign labels
+cluster_label_top2 <- cluster_scores %>%
+group_by(cluster) %>%
+arrange(desc(avg_score)) %>%
+mutate(rank = row_number()) %>%
+filter(rank <= 2) %>%
+ungroup()
+
+cluster_labels_named_1st <- cluster_label_top2 %>% filter(rank == 1) %>% select(cluster, cell_type) %>% deframe()
+
+# Add labels to Seurat metadata
+singlets$top_celltype_label <- cluster_labels_named_1st[as.character(singlets$seurat_clusters)]
+```
+
+## Visualization of Module Score Labels
+
+```{r}
+Idents(singlets) <- singlets$top_celltype_label
+
+p1 <- DimPlot(singlets, reduction = "umap", pt.size = 0.5, raster = FALSE) +
+ggtitle("UMAP colored by Top Cell Type Label (ModuleScore)")
+
+# Calculate cluster centers for labeling
+umap_coords <- Embeddings(singlets, "umap")
+clusters_id <- as.character(singlets$seurat_clusters)
+umap_centers <- aggregate(umap_coords, by = list(cluster = clusters_id), FUN = mean)
+colnames(umap_centers)[2:3] <- c("UMAP_1", "UMAP_2")
+
+# Overlay cluster numbers
+p1 <- p1 + geom_text(
+data = umap_centers,
+aes(x = UMAP_1, y = UMAP_2, label = cluster),
+size = 4,
+color = "black"
+)
+print(p1)
+ggsave("plots/05_umap_marker_top1.png", p1, height = 7, width = 10)
+```
+
+# METHOD 2: AUCell for Gene Set Enrichment
+
+```{r}
+exprMat <- GetAssayData(singlets, assay = "SCT", slot = "data")
+
+# Build rankings
+cells_rankings <- AUCell_buildRankings(exprMat, nCores=1, plotStats=FALSE)
+
+# Calculate AUC scores
+auc_scores <- AUCell_calcAUC(marker_list, cells_rankings, aucMaxRank = ceiling(0.05 * nrow(exprMat)))
+auc_df <- as.data.frame(t(getAUC(auc_scores))) # cells × gene sets
+
+# Make sure column names are valid for Seurat metadata
+colnames(auc_df) <- make.names(colnames(auc_df), unique = TRUE)
+
+singlets <- AddMetaData(singlets, metadata = auc_df)
+
+# Calculate average AUC scores per cluster for plotting
+# Need to use the new column names (post make.names) for selection
+valid_auc_cols <- colnames(auc_df)
+
+avg_auc <- singlets@meta.data %>%
+  as_tibble() %>%
+  group_by(seurat_clusters) %>%
+  summarise(across(all_of(valid_auc_cols), mean, .names = "mean_{.col}")) %>%
+  column_to_rownames(var = "seurat_clusters") %>%
+  t()
+rownames(avg_auc) <- sub("mean_", "", rownames(avg_auc))
+```
+
+## Visualization of AUCell Results
+
+```{r}
+# DotPlot for AUC scores
+Idents(singlets) <- "seurat_clusters"
+p_auc_dot <- DotPlot(singlets, features = rownames(avg_auc), group.by = "seurat_clusters",
+   dot.scale = 6, cols = c("lightgrey", "red")) +
+RotatedAxis() +
+labs(size = "Mean AUC Score", color = "Fraction of Cells") +
+ggtitle("AUCell Gene Set Activity across Clusters") +
+theme_minimal(base_size = 14) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_auc_dot)
+
+ggsave("plots/05_dotplot_AUC_gene_sets.png", plot = p_auc_dot, width = 14, height = 8, dpi = 300)
+```
+
+# SAVE FINAL ANNOTATED OBJECT AND SUMMARY
+
+```{r}
+# Save cell cycle summary as CSV
+cellcycle_summary <- singlets@meta.data %>%
+ group_by(seurat_clusters) %>%
+ summarise(
+  n_cells = n(),
+  avg_S_score = mean(S.Score, na.rm = TRUE),
+  avg_G2M_score = mean(G2M.Score, na.rm = TRUE),
+  prop_S = mean(Phase == "S"),
+  prop_G2M = mean(Phase == "G2M"),
+  prop_G1 = mean(Phase == "G1")
+ ) %>%
+ rowwise() %>%
+ mutate(dominant_phase = c("G1", "S", "G2M")[which.max(c(prop_G1, prop_S, prop_G2M))]) %>%
+ ungroup() %>%
+ arrange(as.numeric(as.character(seurat_clusters)))
+
+write.csv(cellcycle_summary, file = "data/processed/cellcycle_summary_per_cluster.csv", row.names = FALSE)
+
+
+# Saving the final annotated Seurat object
+saveRDS(singlets, SAVE_OBJECT_PATH)
+print(paste("Step 5 (Marker Gene Annotation) Complete. Final annotated object saved to:", SAVE_OBJECT_PATH))
+```
+

@@ -1,0 +1,275 @@
+---
+title: "R Notebook - Differential Gene Expression (DGE) and Final Annotation"
+author : Srivalli Kolla
+date : 12 September, 2025
+output: html_notebook
+---
+
+# SETUP AND LOAD LIBRARIES
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tidyr)
+library(RColorBrewer)
+library(randomcoloR) # For distinct color palettes
+library(future) # For parallel processing
+library(scales) # For proportion formatting
+```
+
+# LOAD ANNOTATED DATA
+
+```{r}
+INPUT_OBJECT_PATH <- "path/to/combined_marker_genes_annotated.rds"
+SAVE_FINAL_OBJECT_PATH <- "path/to/combined_de_annotated_MAST.rds"
+SAVE_ALL_MARKERS_PATH <- "path/to/cluster_markers_all.csv"
+SAVE_UPREGULATED_MARKERS_PATH <- "path/to/cluster_markers_upregulated.csv"
+SAVE_PLOTS_DIR <- "path/to/plots/"
+
+if (!file.exists(INPUT_OBJECT_PATH)) {
+  stop("ERROR: Input object not found. Ensure file path is correct.")
+}
+singlets <- readRDS(INPUT_OBJECT_PATH)
+
+# Set SCT assay as default and identities to Seurat clusters for DGE
+DefaultAssay(singlets) <- "SCT"
+Idents(singlets) <- singlets$seurat_clusters
+
+print(paste("Loaded object with", ncol(singlets), "nuclei."))
+```
+
+# DIFFERENTIAL GENE EXPRESSION
+
+```{r}
+# Configure parallel processing for faster marker finding (Adjust workers as needed)
+plan("multicore", workers = 8) 
+options(future.globals.maxSize = 8000 * 1024^2) 
+
+# Force re-correction for DE (required when using SCT after integration/clustering)
+singlets <- PrepSCTFindMarkers(
+  singlets,
+  assay = "SCT",
+  verbose = FALSE
+)
+
+# Run FindAllMarkers using MAST
+cluster_markers <- FindAllMarkers(
+  singlets,
+  assay = "SCT",
+  slot = "data",
+  min.pct = 0.5,
+  logfc.threshold = 0.5, 
+  only.pos = FALSE,
+  test.use = "MAST",
+    verbose = FALSE
+)
+```
+
+# CLEAN AND SAVE MARKER RESULTS
+
+```{r}
+# Filter out mitochondrial genes 
+cluster_markers <- cluster_markers[!grepl("^MT-", toupper(cluster_markers$gene)), ]
+
+# Filter and save all significant markers (p_val_adj < 0.05)
+cluster_markers_filtered <- cluster_markers %>%
+    filter(p_val_adj < 0.05) 
+
+write.csv(cluster_markers_filtered, SAVE_ALL_MARKERS_PATH, row.names = FALSE)
+print(paste("Filtered cluster markers saved to:", SAVE_ALL_MARKERS_PATH))
+
+# Extract and save strictly upregulated markers (for pathway analysis later)
+upregulated <- cluster_markers_filtered %>%
+ filter(avg_log2FC > 0) %>% 
+ group_by(cluster) %>%
+ arrange(p_val_adj) %>%
+ ungroup()
+
+write.csv(upregulated, SAVE_UPREGULATED_MARKERS_PATH, row.names = FALSE)
+print(paste("Upregulated markers saved to:", SAVE_UPREGULATED_MARKERS_PATH))
+
+# Get top 5 genes for visualization
+top5 <- upregulated %>%
+ group_by(cluster) %>%
+ arrange(desc(avg_log2FC)) %>%
+ slice_head(n = 5) %>%
+ pull(gene) %>%
+ unique()
+```
+
+# CELL TYPE ANNOTATION
+
+```{r}
+# Define the standardized annotation mapping table.
+#    Replace the placeholders (e.g., "0", "Cell Type A", "Detailed Subtype A") 
+#    with the corresponding values derived from your DGE analysis.
+cluster_map_raw <- data.frame(
+ Cluster = 0:24, # Ensure this list covers ALL your cluster IDs (e.g., 0, 1, 2, ...)
+ DE_Annotation_broad = c(
+  "Broad Cell Type A", "Broad Cell Type B", "Broad Cell Type C", # ... one for each cluster
+  rep("...", 22) # Placeholder for remaining 22 cluster annotations
+ ),
+ DE_Annotation_detailed = c(
+  "Detailed Subtype A (C0)", "Detailed Subtype B (C1)", "Detailed Subtype C (C2)", # ... one for each cluster
+  rep("...", 22) # Placeholder for remaining 22 cluster detailed annotations
+ ),
+ stringsAsFactors = FALSE
+)
+
+# Define Order for Broad Groups.
+pub_order_broad <- c(
+    "Cardiomyocytes", "Fibroblasts", "Endothelial Cells", # ... include all broad names
+    "Macrophages", "Uncharacterized" # ... in your desired display order
+)
+
+# Apply the mapping and ordering to Seurat metadata.
+cluster_map_final <- cluster_map_raw %>%
+    # Factor the broad annotation according to the fixed publication order
+    mutate(DE_Annotation_broad = factor(DE_Annotation_broad, levels = pub_order_broad)) 
+
+# Add the new, standardized annotation columns to the Seurat object
+singlets$DE_Annotation_broad <- cluster_map_final$DE_Annotation_broad[match(singlets$seurat_clusters, cluster_map_final$Cluster)]
+singlets$DE_Annotation_detailed <- cluster_map_final$DE_Annotation_detailed[match(singlets$seurat_clusters, cluster_map_final$Cluster)]
+
+# Create the combined label for UMAP visualization (e.g., "Detailed Subtype A (C0)")
+singlets$Cluster_Anno_Label <- paste0(
+ as.character(singlets$DE_Annotation_detailed),
+ " (C", 
+ as.character(singlets$seurat_clusters),
+ ")"
+)
+Idents(singlets) <- singlets$Cluster_Anno_Label
+```
+
+# VISUALIZATIONS
+
+## UMAP with Detailed Annotations
+
+```{r}
+# Generate distinct colors for detailed annotations
+n_detailed <- length(unique(singlets$Cluster_Anno_Label))
+colors_detailed <- distinctColorPalette(n_detailed)
+names(colors_detailed) <- unique(singlets$Cluster_Anno_Label)
+
+# Prepare cluster centers for adding cluster numbers
+umap_coords <- Embeddings(singlets, "umap")
+cluster_ids_num <- as.character(singlets$seurat_clusters) 
+centers <- aggregate(umap_coords, by = list(cluster = cluster_ids_num), FUN = mean)
+colnames(centers)[2:3] <- c("UMAP_1", "UMAP_2")
+
+# Plot
+p1 <- DimPlot(
+ singlets,
+ group.by = "Cluster_Anno_Label",
+ repel = TRUE, raster = FALSE, pt.size = 0.5
+) +
+ scale_color_manual(values = colors_detailed) +
+ guides(color = guide_legend(ncol=1, override.aes = list(size=3))) + 
+ labs(title = "UMAP: Detailed Cell Type Annotations") +
+ theme_bw(base_size = 14) +
+ theme(legend.title = element_blank())
+
+# Add cluster numbers as text labels on UMAP
+p1 <- p1 +
+ geom_text(
+  data = centers,
+  aes(x = UMAP_1, y = UMAP_2, label = cluster),
+  inherit.aes = FALSE,
+  color = "black",
+  size = 4,
+  fontface = "bold"
+ )
+print(p1)
+ggsave(paste0(SAVE_PLOTS_DIR, "celltype_detailed_umap.png"), p1, width = 16, height = 9)
+```
+
+## UMAP Split by Genotype
+
+```{r}
+p_split <- DimPlot(
+ singlets,
+ group.by = "Cluster_Anno_Label",
+ split.by = "Genotype", # Assumes a metadata column named 'Genotype' exists
+ repel = TRUE, raster = FALSE, pt.size = 0.5
+) +
+ scale_color_manual(values = colors_detailed) +
+ guides(color = guide_legend(ncol=1, override.aes = list(size=3))) +
+ labs(title = "UMAP: Detailed Cell Type Annotation Split by Genotype") +
+ theme_bw(base_size = 14) +
+ theme(legend.position = "right", legend.title = element_blank())
+
+# Add cluster numbers
+p_split <- p_split +
+ geom_text(
+  data = centers,
+  aes(x = UMAP_1, y = UMAP_2, label = cluster),
+  inherit.aes = FALSE,
+  color = "black",
+  size = 4,
+  fontface = "bold"
+ )
+print(p_split)
+
+ggsave(
+ paste0(SAVE_PLOTS_DIR, "celltype_detailed_umap_split_by_Genotype.png"),
+ p_split,
+ width = 18,
+ height = 8
+)
+```
+
+## DotPlot of Top Markers
+
+```{r}
+# Re-set Idents to detailed cell type names for the DotPlot visualization
+Idents(singlets) <- singlets$DE_Annotation_detailed
+
+p_cluster <- DotPlot(singlets, features = top5, cols = c("lightgrey", "red"), dot.scale = 8) +
+ RotatedAxis() +
+ labs(size = "Avg Expression Scale", color = "Percent Expressed") +
+ ggtitle("Top 5 Upregulated Markers per Cluster (Grouped by Detailed Annotation)") +
+ theme_minimal(base_size = 14) +
+ theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "italic"),
+        axis.text.y = element_text(face = "bold"),
+        plot.title = element_text(hjust = 0.5))
+print(p_cluster)
+ggsave(paste0(SAVE_PLOTS_DIR, "dotplot_DE_celltype.png"), p_cluster, width = 24, height = 10)
+```
+
+## Bar Plot: Broad Cell Type Proportions by Genotype
+
+```{r}
+bar_df <- singlets@meta.data %>%
+ group_by(Genotype, DE_Annotation_broad) %>%
+ summarise(cell_count = n(), .groups = 'drop') %>%
+ group_by(Genotype) %>%
+ mutate(proportion = cell_count / sum(cell_count)) %>%
+ ungroup() %>%
+  # Ensure the broad groups are ordered correctly
+  mutate(DE_Annotation_broad = factor(DE_Annotation_broad, levels = pub_order_broad))
+
+p2 <- ggplot(bar_df, aes(x = DE_Annotation_broad, y = proportion, fill = Genotype)) +
+ geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+ # Use proportion labels formatted as percentage
+ geom_text(aes(label = scales::percent(proportion, accuracy = 0.1)),
+      position = position_dodge(width = 0.9),
+      vjust = -0.2,
+      size = 3) +
+ theme_minimal(base_size = 14) +
+ labs(x = "Cell Type (Broad Annotation)", y = "Proportion of Total Nuclei", fill = "Genotype") +
+ ggtitle("Genotype-wise Cell Type Distribution") +
+ theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+        legend.position = "bottom")
+print(p2)
+ggsave(paste0(SAVE_PLOTS_DIR, "bar_celltype_genotype_broad.png"), p2, width = 14, height = 8)
+```
+
+# SAVE FINAL ANNOTATED OBJECT
+
+```{r}
+saveRDS(singlets, SAVE_FINAL_OBJECT_PATH)
+print(paste("Final DGE-annotated object saved to:", SAVE_FINAL_OBJECT_PATH))
+```
+
