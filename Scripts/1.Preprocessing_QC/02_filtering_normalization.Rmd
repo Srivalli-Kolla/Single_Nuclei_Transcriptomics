@@ -72,19 +72,53 @@ SCTransform performs:
   2. Variance stabilization
   3. Scaling (automatically stores counts in the 'SCT' assay)
 
+We are not regressing out cell cycle (using vars.to.regress). We are only saving the scores for later inspection.
 ```{r}
-# # SCTransform
-combined_filtered <- SCTransform(combined_filtered, 
-                                 vars.to.regress = c("percent.mt"), 
-                                 verbose = FALSE)
+# Set raw counts back as default before running SCTransform
+DefaultAssay(combined_filtered) <- "RNA"
 
-# Note: The 'percent.mt' variable is regressed out to remove variance driven by cell quality differences.
+# SCTransform performs filtering, normalization, and scaling.
+combined_filtered <- SCTransform(combined_filtered,
+                vars.to.regress = c("percent.mt"), 
+                verbose = FALSE)
+
+# Note: The 'percent.mt' variable is regressed out. Cell cycle effects are retained.
+```
+
+# ADD CELL CYCLE SCORING AND CHECK
+
+Score cells for S and G2M phases and check if cell cycle phase is highly correlated with low QC metrics.
+
+```{r}
+# Mouse cell cycle gene sets
+s.genes.mouse <- c("Mcm5","Pcna","Tyms","Fen1","Mcm2","Mcm4","Rrm1","Ung","Gins2","Mcm6","Cdca7","Dtl","Prim1","Uhrf1","Mcm3","Mcm7","Slbp","Cdc45","Tk1","Lig1","Rpa2","Cdc6","Exo1","Tipin","Dscc1","Blm","Casp8ap2","Usp1","Clspn","Polr1d","Hells","Rfc2","Rpa3","Rrm2","Nasp","Rad51ap1","Gmnn","Wdr76","Slk","Cdc7","Dck")
+g2m.genes.mouse <- c("Hmgb2","Cdc20","Bub1","Cdk1","Tpx2","Nusap1","Ckap2l","Ckap2","Aurkb","Birc5","Kif11","Anp32e","Tubb4b","Gtse1","Kif20b","Hjurp","Cdca3","Cdc25c","Ckap5","Cdc20","Esco2","Hmgb2","Cenpf","Ttk","Kif2c","Ndc80","Cdc45","Tacc3","Cdc6","Pimreg","Kif4a","Nuf2","Cenpe","Cdca8","Ect2","Kif23","Cdc20","Cks2","Nek2","Cdca2","Cks1b","Cdc25a")
+
+# Cell cycle scoring: uses the currently active assay (SCT) by default
+combined_filtered <- CellCycleScoring(
+combined_filtered,
+s.features = s.genes.mouse,
+g2m.features = g2m.genes.mouse,
+set.ident = FALSE # Do not change active identity
+)
+
+print("Cell cycle scores (S.Score, G2M.Score, Phase) have been added to metadata.")
+
+# VISUALIZATION CHECK 
+p_cc_vln <- VlnPlot(combined_filtered,
+       features = c("S.Score", "G2M.Score"),
+       group.by = "Phase", # Check scores by the assigned phase
+       pt.size = 0, ncol = 2)+
+             labs(title = "S and G2M Scores by Assigned Phase")
+
+print(p_cc_vln)
+ggsave("plots/02_VlnPlot_CC_Scores.png", p_cc_vln, width = 8, height = 4)
 ```
 
 # SAVE THE FILTERED AND NORMALIZED OBJECT
 
 ```{r}
 saveRDS(combined_filtered, file = SAVE_OBJECT_PATH)
-print("Step 2 (Filtering and Normalization) Complete. Object saved to 'data/processed/'.")
+print("Step 2 (Filtering and Normalization) Complete. Object saved with Cell Cycle scores.")
 ```
 
