@@ -1,0 +1,250 @@
+---
+title: "R Notebook - Quality Check and Visualization"
+author : Srivalli Kolla
+output: html_notebook
+---
+
+# SETUP AND LOAD LIBRARIES
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tibble)
+library(reshape2)
+library(inflection)
+library(DropletUtils)
+```
+
+# DEFINE DATA PATHS AND METADATA
+
+```{r}
+# List of sample names 
+sample_names <- c(
+ "Sample1_Control", "Sample2_Control", "Sample3_Treated", "Sample4_Treated"
+)
+
+# List of full file paths to the Cell Ranger filtered_feature_bc_matrix directory for each sample
+data_paths <- paste0("path/to/your/data/location/", sample_names, "/filtered_feature_bc_matrix/") # update with your path
+
+# Define the custom metadata table - Update values to match your experimental design 
+meta_info <- data.frame(
+ sample_id_short = paste0("S", 1:length(sample_names)),
+ Sample_ID = sample_names,
+ Sex = rep(c("male", "female"), length(sample_names)/2),
+ Genotype = rep(c("WildType", "Mutant"), each = length(sample_names)/2),
+ Condition = rep(c("Control", "Treated"), each = length(sample_names)/2),
+ stringsAsFactors = FALSE 
+)
+```
+
+# IMPORT DATA AND CALCULATE QC METRICS PER SAMPLE
+
+```{r}
+seurat_list <- list()
+# Create a loop to go through all the samples
+for (i in seq_along(sample_names)) {
+ sample_tag <- sample_names[i]
+ data <- Read10X(data.dir = data_paths[i])
+
+ # Make barcodes unique by adding a suffix (e.g., _Sample1_Control)
+ colnames(data) <- paste0(colnames(data), "_", sample_tag)
+
+ seu <- CreateSeuratObject(counts = data, project = sample_tag)
+ seu$Sample_ID <- sample_tag # Store full sample name
+ seu$sample_short <- meta_info$sample_id_short[i] # Store short sample ID
+
+    # NOTE: Adjust the pattern for mitochondrial genes based on your species: Human: "^MT-" | Mouse: "^mt-" | Ribosomal: "^Rps|^Rpl"
+ 
+ seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^mt-")
+ seu[["percent.ribo"]] <- PercentageFeatureSet(seu, pattern = "^Rps|^Rpl")
+
+ # Add metadata from meta_info
+ meta_row <- meta_info[meta_info$Sample_ID == sample_tag, ]
+
+ if (nrow(meta_row) == 1) {
+  for (col in colnames(meta_row)) {
+   seu[[col]] <- meta_row[[col]][1] # Use [1] to handle the data frame structure
+  }
+ } else {
+  warning(paste("Metadata not found for:", sample_tag))
+ }
+
+ seurat_list[[sample_tag]] <- seu
+}
+```
+
+# MERGE RAW OBJECTS FOR COMBINED QC VISUALIZATION
+
+```{r}
+# Merge all the samples information
+combined_raw <- merge(seurat_list[[1]], y = seurat_list[-1])
+combined_raw
+
+# For large datasets, use the following line to clear memory *after* running the merge
+# rm(seurat_list)
+```
+
+# VISUALIZATION OF QC METRICS (TO DETERMINE FILTERING THRESHOLDS)
+
+```{r}
+# PLOT A: Violin Plots by Sample
+p_violin_before <- VlnPlot(
+ combined_raw,
+ features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.ribo"),
+ group.by = "Sample_ID", pt.size = 0, raster=FALSE, ncol = 4
+)
+print(p_violin_before)
+ggsave("plots/01_QC_ViolinPlots_Raw.png", p_violin_before, width = 14, height = 6)
+```
+
+```{r}
+# PLOT B: Bar Plot of Raw Cell Counts
+cell_counts_before <- as.data.frame(table(combined_raw$Sample_ID))
+colnames(cell_counts_before) <- c("Sample_ID", "CellCount")
+
+bar_1 <- ggplot(cell_counts_before, aes(x = Sample_ID, y = CellCount)) +
+ geom_bar(stat = "identity") +
+ geom_text(aes(label = CellCount), vjust = -0.5, size = 3) +
+ theme_minimal() +
+ labs(title = "Raw Cell Counts Before Filtering", x = "Sample", y = "Number of Cells") +
+ theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(bar_1)
+ggsave("plots/01_CellCounts_Raw.png", bar_1, width = 8, height = 6)
+```
+
+```{r}
+# PLOT C: Barcode Rank Plot
+# Extract raw counts 
+raw_counts <- combined_raw[["RNA"]]@counts
+
+# Calculate barcode ranks (uses the EDE internally for knee/inflection)
+br.out <- barcodeRanks(raw_counts)
+
+# Extract points for annotation
+knee_point <- metadata(br.out)$knee
+inflection_point <- metadata(br.out)$inflection
+
+# Create plot data
+df_elbow <- data.frame(
+    rank = br.out$rank, 
+    counts = br.out$total
+)
+
+p_knee <- ggplot(df_elbow, aes(x = rank, y = counts)) +
+ geom_line(color = "purple", size = 1) +
+ scale_y_log10() +
+ scale_x_log10() + # Log-log scale for clear knee visualization
+ 
+ # Highlight the automatically calculated Knee point
+ geom_hline(yintercept = knee_point, linetype = "dashed", color = "red", linewidth = 1) +
+ annotate("text", x = 10, y = knee_point, 
+           label = paste0("Knee (UMI Min): ", formatC(knee_point, format="d", big.mark=",")), 
+           color = "red", size = 4, hjust = 0, vjust = -0.5) +
+
+ labs(title = "Canonical Barcode Rank Plot (UMI Counts)", 
+       subtitle = "Red line is the estimated knee point (minimum UMI cutoff).",
+       x = "Cell Rank (Log Scale)", 
+       y = "Total Counts (nCount_RNA) (Log Scale)") +
+ theme_minimal(base_size = 13)
+
+print(p_knee)
+ggsave("plots/01_QC_BarcodeRank_KneePlot.png", p_knee, width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# Function to calculate and plot EDE inflection point on a QC metric
+plot_qc_inflection_ede <- function(combined_raw, feature_name, bin_width_val, plot_title, reverse_sort = FALSE) {
+    
+    # Prepare data vector (sort is crucial for inflection package)
+    qc_vector <- combined_raw@meta.data[[feature_name]]
+    qc_vector_sorted <- sort(qc_vector, decreasing = reverse_sort)
+    
+    # Calculate inflection points using EDE
+    inflect_res <- tryCatch({
+        # Use EDE (index 2) calculation
+        inflection::findiplist(seq_along(qc_vector_sorted), qc_vector_sorted, index = TRUE)
+    }, error = function(e) {
+        warning(paste("Inflection calculation failed for", feature_name, ":", e$message))
+        return(NULL)
+    })
+    
+    if (is.null(inflect_res) || nrow(inflect_res) < 2) {
+        message(paste("Skipping EDE plot for", feature_name, "due to calculation failure or insufficient results."))
+        return(NULL)
+    }
+    
+    # Extract EDE value (typically row 2 for EDE)
+    inflection_index_EDE_round <- round(inflect_res[2, 1])
+    inflection_value_EDE <- qc_vector_sorted[inflection_index_EDE_round]
+
+    # Create histogram plot
+    df <- data.frame(qc_value = qc_vector)
+    
+    # Determine max height for annotation positioning
+    h_counts <- table(cut(df$qc_value, breaks = seq(min(df$qc_value, na.rm=TRUE), max(df$qc_value, na.rm=TRUE), by = bin_width_val)))
+    max_y <- max(h_counts, na.rm=TRUE) * 0.9
+    
+    p <- ggplot(df, aes(x = qc_value)) +
+        geom_histogram(binwidth = bin_width_val, fill = "grey80", color = "black") +
+        
+        # Highlight the suggested EDE cutoff
+        geom_vline(xintercept = inflection_value_EDE, color = "blue", linetype = "dashed", linewidth = 1) +
+        
+        labs(title = plot_title,
+             subtitle = paste0("Suggested EDE Cutoff: ", round(inflection_value_EDE, ifelse(inflection_value_EDE > 10, 0, 2))),
+             x = feature_name,
+             y = "Number of Nuclei") +
+        
+        annotate("text", x = inflection_value_EDE, y = max_y, 
+                 label = paste0("EDE: ", round(inflection_value_EDE, ifelse(inflection_value_EDE > 10, 0, 2))), 
+                 color = "blue", angle = 90, vjust = -0.5) +
+        
+        theme_minimal(base_size = 13)
+    
+    print(p)
+    
+    # Save the plot
+    ggsave(paste0("plots/01_QC_Inflection_", feature_name, ".png"), plot = p, width = 8, height = 6, dpi = 300)
+    
+    # Return the suggested value
+    return(inflection_value_EDE)
+}
+```
+
+```{r}
+# PLOT D : QC Metrics Histograms with EDE Inflection
+
+# 1. Total Counts (nCount_RNA) - Use EDE on histogram for comparison with knee point
+p_counts <- plot_qc_inflection_ede(combined_raw, "nCount_RNA", bin_width_val = 500, plot_title = "Total Counts (nCount_RNA)", reverse_sort = FALSE)
+
+# 2. Number of Features (nFeature_RNA) - Lower cutoff suggestion
+p_features <- plot_qc_inflection_ede(combined_raw, "nFeature_RNA", bin_width_val = 200, plot_title = "Detected Genes (nFeature_RNA)", reverse_sort = FALSE)
+
+# 3. Mitochondrial percentage (percent.mt) - Upper cutoff suggestion
+# NOTE: bin_width = 1 is standard for percentages.
+p_mt <- plot_qc_inflection_ede(combined_raw, "percent.mt", bin_width_val = 1, plot_title = "Mitochondrial Percentage (%MT)", reverse_sort = FALSE)
+
+# 4. Ribosomal percentage (percent.ribo) - Upper cutoff suggestion
+p_ribo <- plot_qc_inflection_ede(combined_raw, "percent.ribo", bin_width_val = 1, plot_title = "Ribosomal Percentage (%Ribo)", reverse_sort = FALSE)
+
+
+# C. Combine all EDE Histogram plots for easy comparison
+combined_ede_plots <- (p_counts / p_features) | (p_mt / p_ribo)
+ggsave("plots/01_QC_EDE_Histograms_Combined.png", combined_ede_plots, width = 16, height = 12, dpi = 300)
+```
+
+The Extremum Distance Estimator (EDE) line is a data-driven tool that finds the point of maximum curvature on the distribution of your QC metrics. This value provides a reproducible threshold suggesting the boundary between high-quality profiles and debris/stressed cells.
+
+ EDE Guidance Summary:
+ - For MINIMUM cutoffs (nCount_RNA, nFeature_RNA), EDE suggests the point separating background noise/debris where expression profile becomes too sparse, indicating poor-quality or fragmented nuclei.
+ - For MAXIMUM cutoffs (percent.mt, percent.ribo), EDE suggests the point where the high-quality distribution starts its sharp decline indicating compromised or dying cells beyond this point.
+
+# SAVE THE RAW OBJECT
+
+```{r}
+saveRDS(combined_raw, file = "data/processed/combined_raw_unfiltered.rds") 
+print("Step 1 (QC and Visualization) Complete. Raw Seurat object saved to 'data/processed/'.")
+```
+
