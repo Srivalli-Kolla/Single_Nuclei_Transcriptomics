@@ -1,0 +1,236 @@
+---
+title: "Compositional Analysis - Cell Proportion & Differential Abundance (MiloR)"
+author: Srivalli Kolla
+output: html_notebook
+---
+
+#  Compositional Analysis and Differential Abundance
+
+This script performs two types of compositional analysis:
+1. **Cell Type Proportion Analysis:** Standard analysis using Wilcoxon tests on cell proportions per sample.
+2. **Differential Abundance (DA) Analysis:** Advanced, local analysis using the **MiloR** package to identify changes in cell density (DA neighborhoods) between genotypes.
+
+## 1. Setup and Data Loading
+
+```{r}
+library(miloR)
+library(SingleCellExperiment)
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggpubr) 
+library(viridis)
+library(tidyr) 
+library(ggrepel)
+library(rstatix)
+```
+
+# Load Data
+
+```{r}
+# Define relative output paths
+data_out_dir <- "data/compositional_analysis"
+plots_out_dir <- "plots/compositional_analysis"
+dir.create(data_out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(plots_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+singlets <- readRDS("path/to/combined_de_annotated_MAST.rds")
+cat("Seurat object loaded with", ncol(singlets), "nuclei.\n")
+
+DefaultAssay(singlets) <- "SCT"
+
+# Convert to SingleCellExperiment and set required columns
+sce <- as.SingleCellExperiment(singlets, assay = "RNA")
+colData(sce)$Sample <- colData(sce)$Sample_ID
+colData(sce)$Genotype <- colData(sce)$Genotype
+```
+
+# Global Cell Proportion Analysis
+
+## Calculate Proportions and Test
+```{r}
+# Count cells and calculate proportions using DE_Annotation_broad
+prop_df <- as.data.frame(table(sce$Sample_ID, sce$DE_Annotation_broad, sce$Genotype)) %>%
+  setNames(c("Sample_ID", "CellType", "Genotype", "Count")) %>%
+  group_by(Sample_ID) %>%
+  mutate(Prop = Count / sum(Count)) %>%
+  ungroup()
+
+# Wilcoxon tests per broad cell type
+results_prop <- prop_df %>%
+  group_by(CellType) %>%
+  wilcox_test(Prop ~ Genotype) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance("p.adj") %>%
+  rename(FDR = p.adj) %>%
+  select(CellType, p, FDR, p.signif) %>%
+  arrange(FDR)
+
+# Save stats
+write_csv(results_prop, file.path(data_out_dir, "celltype_proportion_stats_broad.csv"))
+results_prop
+```
+
+
+## Visualization: Proportion Boxplots
+```{r}
+p_prop <- ggplot(prop_df, aes(x = Genotype, y = Prop, fill = Genotype)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.6) +
+  facet_wrap(~ CellType, scales = "free_y", ncol = 4) +
+  theme_minimal(base_size = 14) +
+  labs(y = "Proportion of Nuclei per Sample", title = "Global Cell Type Proportions (Broad)") +
+  theme(strip.text = element_text(face = "bold"), legend.position = "none") +
+  stat_compare_means(method = "wilcox.test", label = "p.format", label.y.npc = 0.98, size = 4)
+
+ggsave(file.path(plots_out_dir, "celltype_proportion_boxplots_broad.png"), plot = p_prop, width = 10, height = 8, dpi = 300)
+p_prop
+```
+
+# Differential Abundance Analysis (MiloR)
+
+## Build Milo Object, Graph, and Neighborhoods
+```{r}
+milo <- Milo(sce)
+milo <- buildGraph(milo, k = 20, d = 30, reduced.dim = "PCA") 
+milo <- makeNhoods(milo, prop = 0.03, k = 20, d = 30, refined = TRUE)
+milo <- countCells(milo, meta.data = as.data.frame(colData(sce)), sample = "Sample_ID")
+```
+
+## Differential Abundance Testing and Mapping
+```{r}
+# 1. Prepare sample metadata
+sample_meta <- distinct(as.data.frame(colData(sce)[, c("Sample_ID", "Genotype")]))
+rownames(sample_meta) <- sample_meta$Sample_ID
+
+# 2. Run DA test: Define model and contrast
+design <- ~ Genotype
+model_contrasts <- "Genotype1" 
+da_results <- testNhoods(milo, design.df = sample_meta, design = design, model.contrasts = model_contrasts)
+
+# 3. Map neighborhoods to majority broad cell type
+nhood_mat <- as.matrix(milo@nhoods)
+common_cells <- intersect(rownames(nhood_mat), colnames(sce))
+nhood_mat <- nhood_mat[common_cells, , drop = FALSE]
+
+get_majority_celltype <- function(nhood_index, annotation_col) {
+  nh_cells <- common_cells[which(nhood_mat[, nhood_index] > 0)]
+  if (length(nh_cells) == 0) return(NA)
+  names(sort(table(colData(sce)[nh_cells, annotation_col]), decreasing = TRUE))[1]
+}
+
+da_results <- da_results %>%
+  mutate(
+    CellType_broad = sapply(seq_len(ncol(nhood_mat)), get_majority_celltype, annotation_col = "DE_Annotation_broad")
+  )
+```
+
+## Summarize and Save Results
+```{r}
+# Function to create structured summary tables
+summarize_da <- function(df, celltype_col) {
+  df %>%
+    filter(!is.na(.data[[celltype_col]])) %>%
+    group_by(.data[[celltype_col]]) %>%
+    summarize(
+      mean_logFC = mean(logFC, na.rm = TRUE),
+      n_total_nhoods = n(),
+      n_signif_nhoods = sum(PValue < 0.05, na.rm = TRUE),
+      min_pval = min(PValue, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rename(CellType = all_of(celltype_col))
+}
+
+da_summary_broad <- summarize_da(da_results, "CellType_broad")
+
+# Save DA results and summary
+write_csv(da_results, file.path(data_out_dir, "DA_miloR_results_broad.csv"))
+write_csv(da_summary_broad, file.path(data_out_dir, "DA_summary_broad.csv"))
+
+cat("\nBroad Summary:\n")
+da_summary_broad
+```
+
+# Visualization
+
+## Volcano Plot of Neighborhoods
+```{r}
+# Plot function for volcano
+volcano_plot <- function(df, celltype_col, title, out_file, p_cutoff = 0.05) {
+  df <- df %>%
+    mutate(Significant = ifelse(PValue < p_cutoff, "Yes", "No"))
+  df_labels <- df %>% filter(Significant == "Yes") %>% group_by(.data[[celltype_col]]) %>% slice_max(order_by = -log10(PValue), n = 1) %>% ungroup()
+  
+  p <- ggplot(df, aes(x = logFC, y = -log10(PValue), color = .data[[celltype_col]], shape = Significant)) +
+    geom_point(alpha = 0.7, size = 3) +
+    geom_text_repel(data = df_labels, aes(label = .data[[celltype_col]]), size = 3, color = "black", max.overlaps = 5) +
+    scale_shape_manual(values = c("No" = 16, "Yes" = 17)) +
+    geom_hline(yintercept = -log10(p_cutoff), linetype = "dashed", color = "grey50") +
+    theme_minimal(base_size = 14) +
+    labs(title = title, x = "logFC (Genotype vs Control)", y = expression(-log[10](P-value)), color = "Cell Type")
+  
+  ggsave(out_file, plot = p, width = 10, height = 7, dpi = 300)
+}
+
+volcano_plot(da_results, "CellType_broad", "DA neighborhoods (Broad Annotation)", file.path(plots_out_dir, "DA_volcano_broad.png"))
+```
+
+## Bar Plot: Count of Significant Neighborhoods
+
+```{r}
+# Plot function for significant bar plot
+barplot_da_sig <- function(df, celltype_col, title, out_file) {
+  summary_df <- df %>%
+    filter(!is.na(.data[[celltype_col]])) %>%
+    group_by(.data[[celltype_col]]) %>%
+    summarize(
+      n_signif = sum(PValue < 0.05),
+      mean_logFC_sig = mean(logFC[PValue < 0.05], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(mean_logFC_sig = ifelse(is.na(mean_logFC_sig), 0, mean_logFC_sig))
+  
+  p <- ggplot(summary_df, aes(x = reorder(.data[[celltype_col]], n_signif), y = n_signif, fill = mean_logFC_sig)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "Mean logFC (signif only)") +
+    labs(title = title, y = "Number of Significant Neighborhoods", x = NULL) +
+    theme_minimal(base_size = 13)
+  
+  ggsave(out_file, plot = p, width = 8, height = 5, dpi = 300)
+}
+
+barplot_da_sig(da_results, "CellType_broad", "Significant Neighborhoods per Broad Cell Type", file.path(plots_out_dir, "DA_bar_broad_sig.png"))
+```
+
+## Faceted Boxplot of logFC
+
+```{r}
+# Plot function for faceted boxplot
+facet_boxplot_da <- function(df, celltype_col, title, out_file) {
+  summary_df <- df %>%
+    filter(!is.na(.data[[celltype_col]])) %>%
+    group_by(.data[[celltype_col]]) %>%
+    summarize(mean_logFC = mean(logFC, na.rm = TRUE), max_logFC = max(logFC, na.rm = TRUE), min_pval = min(PValue, na.rm = TRUE),
+              p.signif = case_when(min_pval <= 0.001 ~ "***", min_pval <= 0.01  ~ "**", min_pval <= 0.05  ~ "*", TRUE ~ ""),
+              .groups = "drop") %>%
+    mutate(label_text = ifelse(p.signif != "", paste0(p.signif, "\n(P=", signif(min_pval, 3), ")"), ""))
+  
+  df[[celltype_col]] <- factor(df[[celltype_col]], levels = summary_df %>% arrange(desc(mean_logFC)) %>% pull(!!sym(celltype_col)))
+  
+  p <- ggplot(df, aes(x = "Comparison", y = logFC, fill = logFC)) +
+    geom_boxplot(outlier.shape = 1, alpha = 0.7) +
+    facet_wrap(as.formula(paste("~", celltype_col)), scales = "free_y") +
+    geom_text(data = summary_df, aes(x = 1, y = max_logFC + 0.1, label = label_text), color = "black", size = 4, lineheight = 0.9, inherit.aes = FALSE) +
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name = "logFC") +
+    labs(title = title, x = NULL, y = "Neighborhood logFC (Genotype vs Control)") +
+    theme_minimal(base_size = 14) +
+    theme(strip.text = element_text(face = "bold"), plot.title = element_text(face = "bold", hjust = 0.5), axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "bottom")
+  
+  ggsave(out_file, plot = p, width = 12, height = 8, dpi = 300)
+}
+
+facet_boxplot_da(da_results, "CellType_broad", "Faceted DA logFC per Broad Cell Type", file.path(plots_out_dir, "DA_boxplot_broad_facet.png"))
+```
+
