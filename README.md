@@ -13,3 +13,5 @@ The analysis is structured into sequential scripts housed in logical directories
 | **4** | `04_integration_clustering.Rmd` | `3.Annotation` | **Integration & Clustering:** Batch correction (Harmony/Seurat), UMAP, and identification of cell clusters. |
 | **5** | `05_marker_gene_annotation.Rmd` | `3.Annotation` | **Preliminary Annotation:** Initial cell type assignment using canonical marker genes (DotPlots, FeaturePlots). |
 | **6** | `06_deg_annotation.Rmd` | `3.Annotation` | **DGE & Final Annotation:** Cluster DGE (MAST), final standardized cell type labeling, and visualization. |
+| **7** | `07_compositional_analysis_miloR.Rmd` | `4.Differential_Abundance` | **Cell Type Composition:** Differential abundance analysis (MiloR) across conditions. |
+| **8** | `08_cell_cell_interactions_liana.Rmd` | `5.Cell_Cell_interactions` | **Cell-Cell Interactions:** Initial LIANA analysis on aggregated data alogng with factorization. |
