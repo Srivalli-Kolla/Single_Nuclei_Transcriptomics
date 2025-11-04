@@ -1,0 +1,424 @@
+---
+title: "08_cell_cell_interactions_liana"
+output: html_document
+date: "2025-11-04"
+---
+# 💬 Cell-Cell Interaction Analysis (LIANA & Tensor Decomposition)
+
+This script performs a generalized analysis of all intercellular communication detected in the dataset:
+1.  **LIANA per Sample:** Calculates communication scores for all LR pairs across individual samples.
+2.  **Tensor Decomposition (cell2cell):** Decomposes the LIANA scores into interpretable communication mechanisms (factors).
+
+---
+
+# Setup, Data Loading, and Filtering
+
+```{r}
+```{r setup, message=FALSE, warning=FALSE}
+# Load Packages
+library(reticulate)
+use_condaenv("c2c", required = TRUE)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(forcats)
+library(textshape)
+library(ggpubr)
+library(rstatix)
+library(reshape2)
+library(tibble)
+library(scater)
+library(scuttle)
+library(ggplot2)
+library(liana)
+library(decoupleR)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(circlize)
+library(igraph)
+library(ggraph)
+library(Seurat)
+library(ggrepel)
+library(patchwork)
+library(OmnipathR)
+
+# Import cell2cell Python module
+c2c <- reticulate::import(module = "cell2cell")
+
+# Define output directories
+base_path <- "path/to/your/analysis/results/"
+outdir  <- file.path(base_path, "plots/LIANA_broad_sample")
+outdir2 <- file.path(base_path, "data/LIANA_broad_sample")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+dir.create(outdir2, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+# Update this path to your annotated Seurat object
+seurat_object <- readRDS("path/to/your/final_annotated_seurat_object.rds")
+cat("Seurat object loaded with", ncol(seurat_object), "nuclei.\n")
+
+# Create proper SCE object
+singlets_sce <- as.SingleCellExperiment(seurat_object)
+
+# Normalization
+singlets_sce <- scuttle::logNormCounts(singlets_sce)
+
+# Plot and filter low-abundance cell types
+try({
+  p_ab <- singlets_sce %>%
+    get_abundance_summary(sample_col = "Sample_ID", idents_col = "DE_Annotation_broad",
+                          min_cells = 10, min_samples = 3, min_prop = 0.2) %>%
+    plot_abundance_summary()
+  ggsave(file.path(outdir, "abundance_summary.png"), p_ab, width = 10, height = 6)
+}, silent = TRUE)
+
+# Filter low-abundance cell types (recommended)
+singlets_sce <- liana::filter_nonabundant_celltypes(singlets_sce,
+                                                   sample_col = "Sample_ID",
+                                                   idents_col = "DE_Annotation_broad")
+
+cat("SCE object filtered. Remaining cell types:\n")
+print(get_abundance_summary(singlets_sce, sample_col = "Sample_ID", idents_col = "DE_Annotation_broad"))
+```
+
+# Resource Preparation (Human $\rightarrow$ Mouse Homologs) - IF NEEDED
+
+```{r}
+# Download human LR database
+op_resource <- ligrecextra() %>%
+  dplyr::select(source_genesymbol, target_genesymbol) %>%
+  distinct()
+
+# Download the homologene data (Human 9606 -> Mouse 10090)
+hg <- homologene_download(target = 10090, source = 9606, id_type = "genesymbol")
+mouse_homologs <- hg %>%
+  select(genesymbol_source, genesymbol_target) %>%
+  distinct()
+
+## Prepare LIANA custom resource by mapping to mouse homologs ##
+tmp_source <- op_resource %>%
+  left_join(mouse_homologs, by = c("source_genesymbol" = "genesymbol_source"), relationship = "many-to-many") %>%
+  dplyr::rename(source_mouse = genesymbol_target)
+
+tmp_target <- tmp_source %>%
+  left_join(mouse_homologs, by = c("target_genesymbol" = "genesymbol_source"), relationship = "many-to-many") %>%
+  dplyr::rename(target_mouse = genesymbol_target)
+
+# Keep only complete mouse LR pairs
+custom_resource <- tmp_target %>%
+  filter(!is.na(source_mouse) & !is.na(target_mouse)) %>%
+  transmute(
+    source_genesymbol = source_mouse,  # LIANA expects these names
+    target_genesymbol = target_mouse,
+    source_human = source_genesymbol,
+    target_human = target_genesymbol
+  ) %>%
+  distinct()
+custom_resource
+```
+
+# LIANA Run per Sample
+
+```{r}
+# Run LIANA using the custom resource
+sce <- liana_bysample(
+  sce = singlets_sce,
+  sample_col = "Sample_ID",
+  idents_col = "DE_Annotation_broad",
+  resource = "custom",
+  external_resource = custom_resource,  # pass the prepared ref
+  aggregate_how = "both",
+  inplace = TRUE,
+  verbose = TRUE
+)
+
+# Combine and aggregate rank (for filtering/plotting)
+lr_combined <- bind_rows(sce@metadata$liana_res, .id = "sample") %>%
+  mutate(rank_aggregate = rowMeans(select(., magnitude_rank, specificity_rank), na.rm = TRUE))
+lr_combined$inv_agg_rank <- max(lr_combined$rank_aggregate, na.rm = TRUE) - lr_combined$rank_aggregate
+
+# Save full LR table
+write.csv(lr_combined , file = file.path(outdir2, "liana_results_full.csv"), row.names = FALSE)
+lr_combined
+```
+
+# Generalized Visualization (Top Interactions)
+
+```{r}
+# Network plotting function (used for aggregation of LR scores)
+plot_interaction_network <- function(df, title, weight_col = "inv_agg_rank", color_col = "sca.LRscore") {
+  edges <- df %>%
+    group_by(source, target) %>%
+    summarise(
+      weight = mean(.data[[weight_col]], na.rm = TRUE),
+      colorval = mean(.data[[color_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  graph <- graph_from_data_frame(edges, directed = TRUE)
+  
+  ggraph(graph, layout = "fr") +
+    geom_edge_link(
+      aes(width = weight, color = colorval),
+      arrow = arrow(length = unit(4, 'mm')), end_cap = circle(3, 'mm'), alpha = 0.8
+    ) +
+    geom_node_point(size = 10,color = "lightblue") +
+    geom_node_text(aes(label = name), repel = TRUE, size = 6) +
+    scale_edge_width(range = c(0.5, 3)) +
+    scale_edge_colour_gradient(low = "lightblue", high = "darkred") +
+    scale_size(range = c(4, 12)) +
+    theme_void(base_size = 16) +
+    ggtitle(title)
+}
+```
+
+```{r}
+# Overall Top LR Dotplot
+p_dot_general <- liana_dotplot(
+  lr_combined,
+  ntop = 30, # Plotting top 30 interactions overall
+  specificity = "inv_agg_rank",
+  magnitude = "sca.LRscore",
+  y.label = "All Top Interactions (Aggregate Rank)",
+  size.label = "Aggregate Rank",
+  colour.label = "Expression Magnitude",
+  show_complex = TRUE
+) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_colour_gradientn(colors = rev(brewer.pal(11, "RdYlBu")))
+
+ggsave(file.path(outdir, "Overall_Top_30_Dotplot.png"), plot = p_dot_general, width = 20, height = 16, dpi = 300)
+
+#  Aggregated Network Plot (Top 100 Edges)
+# Calculate aggregated network scores across all samples
+p_net_general <- plot_interaction_network(
+  lr_combined %>% group_by(source, target) %>%
+    summarise(avg_inv_agg_rank = mean(inv_agg_rank, na.rm = TRUE), .groups = "drop") %>%
+    slice_max(order_by = avg_inv_agg_rank, n = 100), # Plotting only the top 100 most frequent/strongest edges for clarity
+  title = "Aggregated Network: Top 100 Overall Interactions",
+  weight_col = "avg_inv_agg_rank"
+)
+
+ggsave(file.path(outdir, "Aggregated_Network_Top_100.png"), plot = p_net_general, width = 10, height = 10, dpi = 300)
+```
+
+```{r}
+# Filter and save top 5% of interactions by inverse aggregate rank
+sig_threshold <- 0.05
+liana_sig <- lr_combined %>%
+  dplyr::filter(inv_agg_rank >= (max(inv_agg_rank, na.rm = TRUE) * (1 - sig_threshold))) %>%
+  arrange(desc(inv_agg_rank))
+
+write.csv(liana_sig, file = file.path(outdir2,"lr_results_sig.csv"), row.names = FALSE)
+cat("Saved top 5% (based on rank) of LR interactions to lr_results_sig.csv\n")
+```
+
+# Tensor Decomposition (cell2cell)
+
+## Build Tensor
+```{r}
+# Choose which score to use
+score_col <- "sca.LRscore" 
+
+# Prepare scores for tensor function
+sce@metadata$liana_res <- lapply(sce@metadata$liana_res, function(df){
+  df$LRscore <- df[[score_col]]
+  df
+})
+
+# Build Tensor 
+sce <- liana_tensor_c2c(
+  sce = sce,
+  score_col = "LRscore",
+  sender_col = "source",
+  receiver_col = "target",
+  ligand_col = "ligand.complex",
+  receptor_col = "receptor.complex",
+  how = "outer",
+  conda_env = "c2c"    
+)
+```
+
+## Rank Estimation and Final Tensor Build
+```{r}
+# Extract elbow metric from the initial tensor run
+elbow_metric <- sce@metadata$tensor_res$elbow_metric_raw
+
+# Estimate standard error
+error_average <- elbow_metric %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(rank = row_number()) %>%
+  pivot_longer(-rank, names_to = "run_no", values_to = "error") %>%
+  group_by(rank) %>%
+  summarise(
+    average = mean(error),
+    N = n(),
+    SE.low = average - (sd(error)/sqrt(N)),
+    SE.high = average + (sd(error)/sqrt(N))
+  )
+
+# Plot the elbow
+ggplot(error_average, aes(x = rank, y = average)) +
+  geom_line(color = "red") +
+  geom_ribbon(aes(ymin = SE.low, ymax = SE.high), alpha = 0.1) +
+  geom_vline(xintercept = 1, color = "darkblue") + # 🔑 ACTION REQUIRED: Update 1 with your chosen rank
+  theme_bw() +
+  labs(x = "Rank", y = "Error", title = "Elbow Plot for Rank Estimation")
+```
+
+```{r}
+# Set the estimated rank here
+ESTIMATED_RANK <- 1 
+
+# Re-build Tensor with the chosen rank
+sce <- liana_tensor_c2c(
+  sce = sce,
+  score_col = "LRscore",
+  sender_col = "source",
+  receiver_col = "target",
+  ligand_col = "ligand.complex",
+  receptor_col = "receptor.complex",
+  how = "outer",
+  conda_env = "c2c",
+  rank = ESTIMATED_RANK
+)
+```
+
+## Results Overview and Factor Loadings
+
+```{r}
+# Get the decomposed factors
+factors <- get_c2c_factors(sce)
+factors
+
+# Prepare long-format tables for later analysis/plotting
+lr_long <- factors$interactions %>%
+  pivot_longer(cols = starts_with("Factor"), names_to = "Factor", values_to = "LR_loading")
+
+senders_long <- factors$senders %>%
+  as.data.frame(stringsAsFactors = FALSE) %>% dplyr::rename(sender_celltype = celltype) %>%
+  pivot_longer(cols = starts_with("Factor"), names_to = "Factor", values_to = "sender_loading")
+
+receivers_long <- factors$receivers %>%
+  as.data.frame(stringsAsFactors = FALSE) %>% dplyr::rename(receiver_celltype = celltype) %>%
+  pivot_longer(cols = starts_with("Factor"), names_to = "Factor", values_to = "receiver_loading")
+```
+
+```{r}
+# Plot overview (Context Loadings)
+p_overview <- plot_c2c_overview(sce, group_col = 'Genotype', sample_col = 'Sample_ID')
+ggsave(filename = file.path(outdir, "c2c_overview_context_loadings.png"), plot = p_overview, width = 10, height = 8)
+
+# Statistical comparison boxplots
+all_facts_boxes <- plot_context_boxplot(sce, group_col = 'Genotype', sample_col = 'Sample_ID', test="t.test")
+combined_plot <- wrap_plots(all_facts_boxes, ncol = 4) + plot_layout(guides = "collect") & theme(legend.position = 'bottom', plot.tag = element_text(face = 'bold', size = 16))
+ggsave(filename = file.path(outdir, "all_facts_combined_boxplots.png"), plot = combined_plot, width = 16, height = 12, dpi = 300)
+combined_plot
+```
+
+```{r}
+# Contexts heatmap
+context_heat_plot <- plot_context_heat(sce, group_col = 'Genotype', sample_col = 'Sample_ID')
+png(filename = file.path(outdir, "context_heatmap.png"), width = 1200, height = 800)
+ComplexHeatmap::draw(context_heat_plot)
+dev.off()
+
+# Cell-to-cell loadings plot (Example for Factor 1)
+c2c_cells_plot <- plot_c2c_cells(sce, factor_of_int = "Factor.1", name = "Loadings \nProduct")
+png(filename = file.path(outdir, "factor1_heatmap.png"), width = 1200, height = 800)
+ComplexHeatmap::draw(c2c_cells_plot)
+dev.off()
+
+# Plot and save LR loadings heatmap
+lr_heatmap <- plot_lr_heatmap(sce, n = 20, cluster_columns = FALSE)
+png(filename = file.path(outdir, "lr_heatmap.png"), width = 1200, height = 800)
+ComplexHeatmap::draw(lr_heatmap)
+dev.off()
+```
+
+## Gini Coefficients and Pathway Enrichment
+
+```{r}
+# Gini Coefficients (measure of specificity in cell type usage)
+gini_senders <- calculate_gini(factors$senders)
+write.csv(gini_senders, file = file.path(outdir2, "gini_senders.csv"), row.names = TRUE)
+gini_receivers <- calculate_gini(factors$receivers)
+write.csv(gini_receivers, file = file.path(outdir2, "gini_receivers.csv"), row.names = TRUE)
+
+## Footprint Enrichment Analysis (LR loadings) ##
+# Obtain MSigDB gene sets
+MSigDB <- decoupleR::get_resource(organism = 'mouse', name = 'MSigDB')
+MSigDB_clean <- MSigDB %>%
+  filter(collection %in% c("hallmark", "kegg_pathways", "reactome_pathways", "wikipathways")) %>%
+  dplyr::rename(source = geneset, target = genesymbol) %>%
+  dplyr::mutate(weight = 1)
+
+# Generate the LR gene set
+MSigDB_lr <- generate_lr_geneset(sce, resource = MSigDB_clean)
+```
+
+```{r}
+# Interaction loadings to matrix
+mat <- factors$interactions %>% column_to_rownames("lr") %>% as.matrix()
+
+# Enrichment analysis with decoupler
+res <- decoupleR::run_ulm(mat = mat, network = MSigDB_lr, .source = "set", .target = "lr", minsize=10) %>%
+  mutate(p_adj = p.adjust(p_value, method = "fdr"))
+write.csv(res, file = file.path(outdir2, "All_pathway_enrichments.csv"), row.names = FALSE)
+
+# Filter for significant factors and top pathways
+sig_factors <- res %>% filter(p_adj <= 0.05) %>% pull(condition) %>% unique()
+top_res <- res %>%
+  group_by(condition) %>%
+  filter(p_adj <= 0.05) %>%
+  mutate(log_p = -log10(p_adj + 1e-36)) %>%
+  slice_head(n = 20) %>%
+  ungroup()
+
+# Dotplot for top pathways
+dotplot <- ggplot(top_res, aes(y = source, x = condition, colour = score, size = log_p)) +
+  geom_point(shape = 21) +
+  scale_colour_gradient2(high = "red", low = "blue") +
+  scale_size_continuous(range = c(3, 12)) +
+  theme_bw(base_size = 15) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 0.5, hjust = 1)) +
+  labs(y = "Pathway", x = "Factor", colour = "Activity", size = "-log10(FDR)", title = "Significant Enriched Pathways per Factor")
+
+ggsave(file.path(outdir, "Significant_pathways_dotplot.png"), plot = dotplot, width = 12, height = 10, dpi = 300)
+dotplot
+```
+
+## Cell-type Integration for Enriched LR-Pathway Links
+```{r}
+# Join LR contributions with enrichment results
+lr_contrib <- MSigDB_lr %>% as.data.frame() %>% dplyr::rename(pathway = set) %>%
+  left_join(as.data.frame(factors$interactions) %>% dplyr::rename(lr = lr), by = "lr") %>%
+  pivot_longer(cols = starts_with("Factor"), names_to = "Factor", values_to = "LR_loading") %>%
+  left_join(res %>% dplyr::rename(Factor = condition, pathway = source), by = c("Factor", "pathway")) %>%
+  filter(p_adj <= 0.05) # Filter only significant pathways
+
+# Select top LR-Pathway links (top 20 pathways)
+top_n <- 20
+lr_top <- lr_contrib %>% arrange(desc(score)) %>% distinct(pathway, .keep_all = TRUE) %>% slice_head(n = top_n)
+
+# Combine LR-Pathway links with cell type loadings
+lr_pathway_cells <- lr_top %>%
+  left_join(senders_long, by = "Factor") %>%
+  left_join(receivers_long, by = "Factor") %>%
+  mutate(Interaction_strength = abs(LR_loading * sender_loading * receiver_loading)) %>%
+  arrange(desc(Interaction_strength))
+
+write.csv(lr_pathway_cells, file.path(outdir2, "LR_Pathway_Celltype_Associations.csv"), row.names = FALSE)
+
+# Plot top cell-cell links per pathway (across all cell types)
+# Note: This visualization automatically uses all cell types present in the lr_pathway_cells table.
+lr_pathway_top <- lr_pathway_cells %>% group_by(pathway) %>% slice_max(order_by = Interaction_strength, n = 10) %>% ungroup()
+
+dotplot_pathway_cells <- ggplot(lr_pathway_top, aes(x = sender_celltype, y = receiver_celltype, size = Interaction_strength, color = score)) +
+  geom_point(alpha = 0.9) + facet_wrap(~ pathway, scales = "free", ncol = 3) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red") +
+  theme_bw(base_size = 12) + theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.text = element_text(size = 10), legend.position = "bottom") +
+  labs(title = "Ligand–Receptor Pairs and Cell Types Driving Pathway Enrichment (Generalized Top 20)", x = "Sender Cell Type", y = "Receiver Cell Type", color = "Enrichment Score", size = "Interaction Strength")
+ggsave(filename = file.path(outdir, "LR_Pathway_Celltype_Interactions_Generalized.png"), plot = dotplot_pathway_cells, width = 18, height = 20, dpi = 300)
+dotplot_pathway_cells
+```
