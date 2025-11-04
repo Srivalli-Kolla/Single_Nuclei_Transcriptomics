@@ -1,7 +1,7 @@
 ---
 title: "08_cell_cell_interactions_liana"
-output: html_document
-date: "2025-11-04"
+output: html_notebook
+Author : Srivalli Kolla
 ---
 # 💬 Cell-Cell Interaction Analysis (LIANA & Tensor Decomposition)
 
